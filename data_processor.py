@@ -6,7 +6,6 @@ import seaborn as sns
 from scipy import stats
 import os
 import glob
-import argparse
 from datetime import datetime
 from utils import load_csv, parse_timestamp, calculate_statistics, create_directory, plot_histogram, filter_outliers
 
@@ -51,31 +50,14 @@ class PacketDataProcessor:
             return None
     
     def parse_timestamps(self, df):
-        """
-        Parse the 'Time' column to proper datetime format.
-        
-        Args:
-            df (pd.DataFrame): Input dataframe with 'Time' column
-            
-        Returns:
-            pd.DataFrame: DataFrame with parsed timestamps
-        """
         df = df.copy()
-        
-        # Parse timestamps
         df['timestamp'] = df['Time'].apply(parse_timestamp)
-        
-        # Filter out rows with invalid timestamps
         n_before = len(df)
         df = df.dropna(subset=['timestamp'])
         n_after = len(df)
-        
         if n_before > n_after:
             print(f"Removed {n_before - n_after} rows with invalid timestamps")
-        
-        # Sort by timestamp to ensure correct order for inter-arrival calculation
         df = df.sort_values('timestamp')
-        
         return df
     
     def calculate_inter_arrival_times(self, df, group_by=None):
@@ -86,63 +68,69 @@ class PacketDataProcessor:
             for group_name, group_df in df.groupby(group_by):
                 sorted_group = group_df.sort_values('timestamp')
                 # Calculate inter-arrival time in milliseconds
-                sorted_group['inter_arrival_time'] = sorted_group['timestamp'].diff() * 1000
+                sorted_group['inter_arrival_time'] = sorted_group['timestamp'].diff()
                 result_dfs.append(sorted_group)
             df = pd.concat(result_dfs)
         else:
             # Calculate inter-arrival times for all packets
-            df['inter_arrival_time'] = df['timestamp'].diff() * 1000
-        
-        # Remove rows with NaN inter-arrival times
+            df['inter_arrival_time'] = df['timestamp'].diff()
         df = df.dropna(subset=['inter_arrival_time'])
+        df['inter_arrival_ms'] = df['inter_arrival_time'].dt.total_seconds() * 1000
         return df
     
     def analyze_ip_statistics(self, df):
-        # Source IP statistics
+        # Source IP
         source_counts = df['Source'].value_counts()
         top_sources = source_counts.head(10)
-        
-        # Destination IP statistics
+        # Destination IP
         dest_counts = df['Destination'].value_counts()
         top_dests = dest_counts.head(10)
-        
-        # Protocol statistics
+        # Protocol
         if 'Protocol' in df.columns:
             protocol_counts = df['Protocol'].value_counts()
             top_protocols = protocol_counts.head(10)
         else:
             protocol_counts = None
             top_protocols = None
-        
         # Print summary
         print("\nIP Address Statistics:")
         print(f"Unique Source IPs: {len(source_counts)}")
         print(f"Unique Destination IPs: {len(dest_counts)}")
-        
         print("\nTop Source IPs:")
         for ip, count in top_sources.items():
             print(f"{ip}: {count} packets ({count/len(df)*100:.2f}%)")
-        
         print("\nTop Destination IPs:")
         for ip, count in top_dests.items():
             print(f"{ip}: {count} packets ({count/len(df)*100:.2f}%)")
-        
         if protocol_counts is not None:
             print("\nTop Protocols:")
             for protocol, count in top_protocols.items():
                 print(f"{protocol}: {count} packets ({count/len(df)*100:.2f}%)")
-        
+        # Likely client IP
+        likely_client_ip = None
+        max_count = 0
+        for ip in set(source_counts.index) | set(dest_counts.index):
+            total_count = source_counts.get(ip, 0) + dest_counts.get(ip, 0)
+            if total_count > max_count:
+                max_count = total_count
+                likely_client_ip = ip
+        print(f"\nLikely client IP: {likely_client_ip} (appears in {max_count} packets)")
         return {
             'source_counts': source_counts,
             'dest_counts': dest_counts,
-            'protocol_counts': protocol_counts
+            'protocol_counts': protocol_counts,
+            'likely_client_ip': likely_client_ip
         }
     
-    def extract_upload_download_traffic(self, df, client_ip):
-        # Uplink: client is source
+    def extract_upload_download_traffic(self, df, client_ip=None):
+        if client_ip is None:
+            ip_stats = self.analyze_ip_statistics(df)
+            client_ip = ip_stats['likely_client_ip']
+            print(f"Auto-detected client IP: {client_ip}")
+        # Uplink
         uplink_df = df[df['Source'] == client_ip].copy()
         uplink_df['direction'] = 'uplink'
-        # Downlink: client is destination
+        # Downlink
         downlink_df = df[df['Destination'] == client_ip].copy()
         downlink_df['direction'] = 'downlink'
         print(f"Uplink packets: {len(uplink_df)}")
@@ -153,25 +141,19 @@ class PacketDataProcessor:
         if 'Protocol' not in df.columns:
             print("No 'Protocol' column in dataframe")
             return {}
-        
         protocols = df['Protocol'].unique()
         result = {}
-        
         for protocol in protocols:
             protocol_df = df[df['Protocol'] == protocol].copy()
             if len(protocol_df) > 0:
                 result[protocol] = protocol_df
                 print(f"Protocol {protocol}: {len(protocol_df)} packets")
-        
         return result
     
     def prepare_data_for_modeling(self, df, max_value=None, min_value=None):
-        if 'inter_arrival_time' not in df.columns:
-            raise ValueError("No 'inter_arrival_time' column in dataframe")
-        
-        # Extract data
-        data = df['inter_arrival_time'].values
-        # Apply filters if provided
+        if 'inter_arrival_ms' not in df.columns:
+            raise ValueError("No 'inter_arrival_ms' column in dataframe")
+        data = df['inter_arrival_ms'].values
         if max_value is not None:
             data = data[data <= max_value]
         if min_value is not None:
@@ -180,40 +162,51 @@ class PacketDataProcessor:
         print(f"Mean: {np.mean(data):.2f} ms, Median: {np.median(data):.2f} ms")
         print(f"Min: {np.min(data):.2f} ms, Max: {np.max(data):.2f} ms")
         return data
+    
+    def process_direction_specific_data(self, direction_df, direction, output_dir):
+        if len(direction_df) == 0:
+            print(f"No {direction} packets found")
+            return None
+        direction_df = self.calculate_inter_arrival_times(direction_df)
+        protocol_dfs = self.split_data_by_protocol(direction_df)
+        for protocol, protocol_df in protocol_dfs.items():
+            if len(protocol_df) > 100:
+                protocol_output = os.path.join(output_dir, f"processed_{direction}_{protocol}.csv")
+                protocol_df.to_csv(protocol_output, index=False)
+                print(f"Saved {direction} {protocol} data to {protocol_output}")
+                data = self.prepare_data_for_modeling(protocol_df)
+                fig_path = os.path.join(output_dir, f"{direction}_{protocol}_histogram.png")
+                plt.figure(figsize=(10, 6))
+                plt.hist(data, bins=50, alpha=0.7, density=True)
+                plt.title(f"{direction.capitalize()} {protocol} Inter-arrival Time Distribution")
+                plt.xlabel("Inter-arrival Time (ms)")
+                plt.ylabel("Density")
+                plt.grid(True, alpha=0.3)
+                plt.savefig(fig_path)
+                plt.close()
+                print(f"Saved histogram to {fig_path}")
+
+        output_csv = os.path.join(output_dir, f"processed_{direction}_all.csv")
+        direction_df.to_csv(output_csv, index=False)
+        print(f"Saved {direction} data to {output_csv}")
+        return direction_df
 
 def main():
-    """Main function for command-line usage."""
-    parser = argparse.ArgumentParser(description='Process 5G network packet data')
-    parser.add_argument('--data-dir', type=str, required=True, help='Path to data directory')
-    parser.add_argument('--app', type=str, choices=['Zepeto', 'Roblox', 'all'], default='all',
-                      help='Metaverse application to analyze')
-    parser.add_argument('--max-files', type=int, default=None, help='Maximum number of files to load')
-    parser.add_argument('--output-dir', type=str, default='.', help='Output directory for results')
-    parser.add_argument('--client-ip', type=str, help='Client IP address for up/down traffic analysis')
-
-    args = parser.parse_args()
-    # Create output directory
-    create_directory(args.output_dir)    
-    # Initialize processor
-    processor = PacketDataProcessor(args.data_dir)
-    # Load data
-    if args.app == 'all':
-        df = processor.load_metaverse_data(max_files=args.max_files)
-    else:
-        df = processor.load_metaverse_data(app_name=args.app, max_files=args.max_files)
+    data_dir = 'data/5G_Traffic_Datasets'
+    app_name = 'Zepeto'
+    output_dir = 'data/processed'
+    create_directory(output_dir)
+    
+    processor = PacketDataProcessor(data_dir)
+    df = processor.load_metaverse_data(app_name=app_name)
     if df is None or len(df) == 0:
         print("No data loaded. Exiting.")
         return
-    # Process data
     df = processor.parse_timestamps(df)
-    # Analyze IP statistics to help identify client IP if not provided
-    ip_stats = processor.analyze_ip_statistics(df)
-    # Calculate inter-arrival times
-    df = processor.calculate_inter_arrival_times(df)
-    # Save processed data
-    output_csv = os.path.join(args.output_dir, f"processed_data_{args.app}.csv")
-    df.to_csv(output_csv, index=False)
-    print(f"Saved processed data to {output_csv}")
+    uplink_df, downlink_df = processor.extract_upload_download_traffic(df)
+    processor.process_direction_specific_data(uplink_df, 'uplink', output_dir)
+    processor.process_direction_specific_data(downlink_df, 'downlink', output_dir)
+    print("Processing complete!")
 
 if __name__ == "__main__":
     main()
