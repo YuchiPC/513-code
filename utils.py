@@ -16,19 +16,13 @@ def load_csv(filepath):
 
 def parse_timestamp(time_str):
     try:
-        # For timestamps in format "20:32.6" (likely from your data)
         if ':' in time_str and '.' in time_str and len(time_str.split(':')) == 2:
-            # Split into minutes and seconds
             minutes, seconds = time_str.split(':')
-            # Create a timedelta object
             total_seconds = float(minutes) * 60 + float(seconds)
-            # Return the number of seconds rather than a datetime
             return total_seconds
         elif ':' in time_str:
-            # Standard timestamp with date
             return pd.to_datetime(time_str)
         else:
-            # Try standard format as fallback
             return pd.to_datetime(time_str)
     except Exception as e:
         print(f"Parse error for '{time_str}': {e}")
